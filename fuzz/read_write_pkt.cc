@@ -51,6 +51,10 @@ const uint8_t null_iv[16]{};
 } // namespace
 
 namespace {
+int client_initial(ngtcp2_conn *conn, void *user_data) { return 0; }
+} // namespace
+
+namespace {
 int recv_client_initial(ngtcp2_conn *conn, const ngtcp2_cid *dcid,
                         void *user_data) {
   return 0;
@@ -103,6 +107,12 @@ int null_hp_mask(uint8_t *dest, const ngtcp2_crypto_cipher *hp,
 
   memcpy(dest, NGTCP2_FAKE_HP_MASK, sizeof(NGTCP2_FAKE_HP_MASK) - 1);
 
+  return 0;
+}
+} // namespace
+
+namespace {
+int recv_retry(ngtcp2_conn *conn, const ngtcp2_pkt_hd *hd, void *user_data) {
   return 0;
 }
 } // namespace
@@ -217,11 +227,13 @@ void qlog_write(void *user_data, uint32_t flags, const void *data,
 namespace {
 ngtcp2_conn *setup_conn(FuzzedDataProvider &fuzzed_data_provider) {
   ngtcp2_callbacks cb{
+    .client_initial = client_initial,
     .recv_client_initial = recv_client_initial,
     .recv_crypto_data = recv_crypto_data,
     .encrypt = null_encrypt,
     .decrypt = null_decrypt,
     .hp_mask = null_hp_mask,
+    .recv_retry = recv_retry,
     .rand = genrand,
     .get_new_connection_id = get_new_connection_id,
     .update_key = update_key,
@@ -264,7 +276,6 @@ ngtcp2_conn *setup_conn(FuzzedDataProvider &fuzzed_data_provider) {
 
   ngtcp2_transport_params_default(&params);
 
-  params.original_dcid_present = 1;
   params.original_dcid = odcid;
   params.initial_max_stream_data_bidi_local = 65535;
   params.initial_max_stream_data_bidi_remote = 65535;
@@ -273,7 +284,6 @@ ngtcp2_conn *setup_conn(FuzzedDataProvider &fuzzed_data_provider) {
   params.initial_max_streams_bidi = 3;
   params.initial_max_streams_uni = 2;
   params.max_idle_timeout = 60 * NGTCP2_SECONDS;
-  params.stateless_reset_token_present = 1;
   params.active_connection_id_limit = 8;
   for (size_t i = 0; i < NGTCP2_STATELESS_RESET_TOKENLEN; ++i) {
     params.stateless_reset_token[i] = static_cast<uint8_t>(i);
@@ -281,9 +291,18 @@ ngtcp2_conn *setup_conn(FuzzedDataProvider &fuzzed_data_provider) {
 
   ngtcp2_conn *conn;
 
-  ngtcp2_conn_server_new(&conn, &dcid, &scid, &ps.path, NGTCP2_PROTO_VER_V1,
-                         &cb, &settings, &params,
-                         /* mem = */ nullptr, nullptr);
+  if (fuzzed_data_provider.ConsumeBool()) {
+    params.original_dcid_present = 1;
+    params.stateless_reset_token_present = 1;
+
+    ngtcp2_conn_server_new(&conn, &dcid, &scid, &ps.path, NGTCP2_PROTO_VER_V1,
+                           &cb, &settings, &params,
+                           /* mem = */ nullptr, nullptr);
+  } else {
+    ngtcp2_conn_client_new(&conn, &dcid, &scid, &ps.path, NGTCP2_PROTO_VER_V1,
+                           &cb, &settings, &params,
+                           /* mem = */ nullptr, nullptr);
+  }
 
   ngtcp2_crypto_ctx crypto_ctx{
     .aead =
@@ -335,14 +354,24 @@ ngtcp2_conn *setup_conn(FuzzedDataProvider &fuzzed_data_provider) {
 
   ngtcp2_transport_params remote_params{};
 
-  remote_params.initial_max_stream_data_bidi_local = 64 * 1024;
-  remote_params.initial_max_stream_data_bidi_remote = 64 * 1024;
-  remote_params.initial_max_stream_data_uni = 64 * 1024;
-  remote_params.initial_max_streams_bidi = 0;
-  remote_params.initial_max_streams_uni = 1;
-  remote_params.initial_max_data = 64 * 1024;
-  remote_params.active_connection_id_limit = 8;
-  remote_params.max_udp_payload_size = NGTCP2_DEFAULT_MAX_RECV_UDP_PAYLOAD_SIZE;
+  remote_params.initial_max_stream_data_bidi_local =
+    fuzzed_data_provider.ConsumeIntegralInRange<uint64_t>(0, NGTCP2_MAX_VARINT);
+  remote_params.initial_max_stream_data_bidi_remote =
+    fuzzed_data_provider.ConsumeIntegralInRange<uint64_t>(0, NGTCP2_MAX_VARINT);
+  remote_params.initial_max_stream_data_uni =
+    fuzzed_data_provider.ConsumeIntegralInRange<uint64_t>(0, NGTCP2_MAX_VARINT);
+  remote_params.initial_max_streams_bidi =
+    fuzzed_data_provider.ConsumeIntegralInRange<uint64_t>(0, NGTCP2_MAX_VARINT);
+  remote_params.initial_max_streams_uni =
+    fuzzed_data_provider.ConsumeIntegralInRange<uint64_t>(0, NGTCP2_MAX_VARINT);
+  remote_params.initial_max_data =
+    fuzzed_data_provider.ConsumeIntegralInRange<uint64_t>(0, NGTCP2_MAX_VARINT);
+  remote_params.active_connection_id_limit =
+    fuzzed_data_provider.ConsumeIntegralInRange<uint64_t>(
+      NGTCP2_DEFAULT_ACTIVE_CONNECTION_ID_LIMIT, NGTCP2_MAX_VARINT);
+  remote_params.max_udp_payload_size =
+    fuzzed_data_provider.ConsumeIntegralInRange<uint64_t>(
+      NGTCP2_MAX_UDP_PAYLOAD_SIZE, NGTCP2_MAX_VARINT);
 
   ngtcp2_transport_params_copy_new(&conn->remote.transport_params,
                                    &remote_params, conn->mem);
@@ -375,13 +404,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
   while (fuzzed_data_provider.remaining_bytes() > 0) {
     auto recv_pkt_len = fuzzed_data_provider.ConsumeIntegral<size_t>();
-    
+
     auto recv_pkt = fuzzed_data_provider.ConsumeBytes<uint8_t>(recv_pkt_len);
-    
+
     ts = fuzzed_data_provider.ConsumeIntegralInRange<ngtcp2_tstamp>(
       ts, std::numeric_limits<ngtcp2_tstamp>::max() - 1);
 
-    auto rv = ngtcp2_conn_read_pkt(conn, &ps.path, &pi, recv_pkt.data(), recv_pkt.size(), ts);
+    auto rv = ngtcp2_conn_read_pkt(conn, &ps.path, &pi, recv_pkt.data(),
+                                   recv_pkt.size(), ts);
     if (rv != 0) {
       break;
     }
