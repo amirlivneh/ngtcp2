@@ -48,49 +48,161 @@ constexpr size_t NGTCP2_FAKE_AEAD_OVERHEAD = NGTCP2_INITIAL_AEAD_OVERHEAD;
 
 const uint8_t null_secret[32]{};
 const uint8_t null_iv[16]{};
+const uint8_t null_data[2048]{};
 } // namespace
+
+struct TLSState {
+  FuzzedDataProvider *fuzzed_data_provider;
+  bool keys_installed;
+  bool handshake_completed;
+};
 
 namespace {
 int client_initial(ngtcp2_conn *conn, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int recv_client_initial(ngtcp2_conn *conn, const ngtcp2_cid *dcid,
                         void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  ngtcp2_crypto_ctx crypto_ctx{
+    .aead =
+      {
+        .max_overhead = NGTCP2_FAKE_AEAD_OVERHEAD,
+      },
+    .max_encryption = 9999,
+    .max_decryption_failure = 8888,
+  };
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  ngtcp2_conn_set_initial_crypto_ctx(conn, &crypto_ctx);
+
+  ngtcp2_crypto_aead_ctx aead_ctx{};
+  ngtcp2_crypto_cipher_ctx hp_ctx{};
+
+  if (ngtcp2_conn_install_initial_key(conn, &aead_ctx, null_iv, &hp_ctx,
+                                      &aead_ctx, null_iv, &hp_ctx,
+                                      sizeof(null_iv)) != 0) {
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+
+  return 0;
 }
+} // namespace
+
+namespace {
+ngtcp2_cid dcid, scid, odcid;
 } // namespace
 
 namespace {
 int recv_crypto_data(ngtcp2_conn *conn,
                      ngtcp2_encryption_level encryption_level, uint64_t offset,
                      const uint8_t *data, size_t datalen, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  ngtcp2_crypto_ctx crypto_ctx{
+    .aead =
+      {
+        .max_overhead = NGTCP2_FAKE_AEAD_OVERHEAD,
+      },
+    .max_encryption = 9999,
+    .max_decryption_failure = 8888,
+  };
+
+  ngtcp2_conn_set_crypto_ctx(conn, &crypto_ctx);
+
+  ngtcp2_crypto_aead_ctx aead_ctx{};
+  ngtcp2_crypto_cipher_ctx hp_ctx{};
+
+  switch (encryption_level) {
+  case NGTCP2_ENCRYPTION_LEVEL_INITIAL:
+    if (!tls_state->keys_installed) {
+      tls_state->keys_installed = true;
+
+      if (ngtcp2_conn_install_rx_handshake_key(conn, &aead_ctx, null_iv,
+                                               sizeof(null_iv), &hp_ctx) != 0) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+      }
+      if (ngtcp2_conn_install_tx_handshake_key(conn, &aead_ctx, null_iv,
+                                               sizeof(null_iv), &hp_ctx) != 0) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+      }
+
+      if (ngtcp2_conn_install_rx_key(conn, null_secret, sizeof(null_secret),
+                                     &aead_ctx, null_iv, sizeof(null_iv),
+                                     &hp_ctx)) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+      }
+
+      if (ngtcp2_conn_install_tx_key(conn, null_secret, sizeof(null_secret),
+                                     &aead_ctx, null_iv, sizeof(null_iv),
+                                     &hp_ctx) != 0) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+      }
+
+      auto chunk_len =
+        tls_state->fuzzed_data_provider->ConsumeIntegral<size_t>();
+      auto chunk =
+        tls_state->fuzzed_data_provider->ConsumeBytes<uint8_t>(chunk_len);
+
+      auto rv = ngtcp2_conn_decode_and_set_remote_transport_params(
+        conn, chunk.data(), chunk.size());
+      if (rv != 0) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+      }
+
+      rv = ngtcp2_conn_submit_crypto_data(conn, NGTCP2_ENCRYPTION_LEVEL_INITIAL,
+                                          null_data, 123);
+      if (rv != 0) {
+        return rv;
+      }
+
+      rv = ngtcp2_conn_submit_crypto_data(
+        conn, NGTCP2_ENCRYPTION_LEVEL_HANDSHAKE, null_data, 1999);
+      if (rv != 0) {
+        return rv;
+      }
+    }
+
+    break;
+  case NGTCP2_ENCRYPTION_LEVEL_HANDSHAKE:
+    if (!tls_state->handshake_completed) {
+      tls_state->handshake_completed = true;
+
+      ngtcp2_conn_tls_handshake_completed(conn);
+    }
+
+    break;
+  default:
+    break;
+  }
+
+  return 0;
 }
 } // namespace
 
 namespace {
 int handshake_completed(ngtcp2_conn *conn, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int recv_version_negotiation(ngtcp2_conn *conn, const ngtcp2_pkt_hd *hd,
                              const uint32_t *sv, size_t nsv, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -140,9 +252,11 @@ namespace {
 int recv_stream_data(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                      uint64_t offset, const uint8_t *data, size_t datalen,
                      void *user_data, void *stream_user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -150,17 +264,21 @@ namespace {
 int acked_stream_data_offset(ngtcp2_conn *conn, int64_t stream_id,
                              uint64_t offset, uint64_t datalen, void *user_data,
                              void *stream_user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int stream_open(ngtcp2_conn *conn, int64_t stream_id, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -168,9 +286,11 @@ namespace {
 int stream_close(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                  uint64_t app_error_code, void *user_data,
                  void *stream_user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -178,35 +298,43 @@ namespace {
 int recv_stateless_reset(ngtcp2_conn *conn,
                          const ngtcp2_pkt_stateless_reset *sr,
                          void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int recv_retry(ngtcp2_conn *conn, const ngtcp2_pkt_hd *hd, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int extend_max_local_streams_bidi(ngtcp2_conn *conn, uint64_t max_streams,
                                   void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int extend_max_local_streams_uni(ngtcp2_conn *conn, uint64_t max_streams,
                                  void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -219,9 +347,9 @@ void genrand(uint8_t *dest, size_t destlen, const ngtcp2_rand_ctx *rand_ctx) {
 namespace {
 int get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token,
                           size_t cidlen, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  if (fuzzed_data_provider->ConsumeBool()) {
+  if (tls_state->fuzzed_data_provider->ConsumeBool()) {
     return NGTCP2_ERR_CALLBACK_FAILURE;
   }
 
@@ -239,9 +367,11 @@ int get_new_connection_id(ngtcp2_conn *conn, ngtcp2_cid *cid, uint8_t *token,
 namespace {
 int remove_connection_id(ngtcp2_conn *conn, const ngtcp2_cid *cid,
                          void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -252,9 +382,9 @@ int update_key(ngtcp2_conn *conn, uint8_t *rx_secret, uint8_t *tx_secret,
                const uint8_t *current_rx_secret,
                const uint8_t *current_tx_secret, size_t secretlen,
                void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  if (fuzzed_data_provider->ConsumeBool()) {
+  if (tls_state->fuzzed_data_provider->ConsumeBool()) {
     return NGTCP2_ERR_CALLBACK_FAILURE;
   }
 
@@ -279,18 +409,22 @@ namespace {
 int path_validation(ngtcp2_conn *conn, uint32_t flags, const ngtcp2_path *path,
                     const ngtcp2_path *old_path,
                     ngtcp2_path_validation_result res, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int select_preferred_addr(ngtcp2_conn *conn, ngtcp2_path *dest,
                           const ngtcp2_preferred_addr *paddr, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -298,27 +432,33 @@ namespace {
 int stream_reset(ngtcp2_conn *conn, int64_t stream_id, uint64_t final_size,
                  uint64_t app_error_code, void *user_data,
                  void *stream_user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int extend_max_remote_streams_bidi(ngtcp2_conn *conn, uint64_t max_streams,
                                    void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int extend_max_remote_streams_uni(ngtcp2_conn *conn, uint64_t max_streams,
                                   void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -326,9 +466,11 @@ namespace {
 int extend_max_stream_data(ngtcp2_conn *conn, int64_t stream_id,
                            uint64_t max_data, void *user_data,
                            void *stream_user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -336,26 +478,32 @@ namespace {
 int dcid_status(ngtcp2_conn *conn, ngtcp2_connection_id_status_type type,
                 uint64_t seq, const ngtcp2_cid *cid, const uint8_t *token,
                 void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int handshake_confirmed(ngtcp2_conn *conn, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int recv_new_token(ngtcp2_conn *conn, const uint8_t *token, size_t tokenlen,
                    void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -373,33 +521,39 @@ void delete_crypto_cipher_ctx(ngtcp2_conn *conn,
 namespace {
 int recv_datagram(ngtcp2_conn *conn, uint32_t flags, const uint8_t *data,
                   size_t datalen, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int ack_datagram(ngtcp2_conn *conn, uint64_t dgram_id, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int lost_datagram(ngtcp2_conn *conn, uint64_t dgram_id, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int get_path_challenge_data(ngtcp2_conn *conn, uint8_t *data, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  if (fuzzed_data_provider->ConsumeBool()) {
+  if (tls_state->fuzzed_data_provider->ConsumeBool()) {
     return NGTCP2_ERR_CALLBACK_FAILURE;
   }
 
@@ -413,18 +567,20 @@ namespace {
 int stream_stop_sending(ngtcp2_conn *conn, int64_t stream_id,
                         uint64_t app_error_code, void *user_data,
                         void *stream_user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int version_negotiation(ngtcp2_conn *conn, uint32_t version,
                         const ngtcp2_cid *client_dcid, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  if (fuzzed_data_provider->ConsumeBool()) {
+  if (tls_state->fuzzed_data_provider->ConsumeBool()) {
     return NGTCP2_ERR_CALLBACK_FAILURE;
   }
 
@@ -442,26 +598,32 @@ int version_negotiation(ngtcp2_conn *conn, uint32_t version,
 namespace {
 int recv_rx_key(ngtcp2_conn *conn, ngtcp2_encryption_level level,
                 void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int recv_tx_key(ngtcp2_conn *conn, ngtcp2_encryption_level level,
                 void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
 namespace {
 int tls_early_data_rejected(ngtcp2_conn *conn, void *user_data) {
-  auto fuzzed_data_provider = static_cast<FuzzedDataProvider *>(user_data);
+  auto tls_state = static_cast<TLSState *>(user_data);
 
-  return fuzzed_data_provider->ConsumeBool() ? NGTCP2_ERR_CALLBACK_FAILURE : 0;
+  return tls_state->fuzzed_data_provider->ConsumeBool()
+           ? NGTCP2_ERR_CALLBACK_FAILURE
+           : 0;
 }
 } // namespace
 
@@ -520,8 +682,7 @@ void *fuzzed_realloc(void *ptr, size_t size, void *user_data) {
 } // namespace
 
 namespace {
-ngtcp2_conn *setup_conn(FuzzedDataProvider &fuzzed_data_provider,
-                        const ngtcp2_mem &mem) {
+ngtcp2_conn *setup_conn(TLSState *tls_state, const ngtcp2_mem &mem) {
   ngtcp2_callbacks cb{
     .client_initial = client_initial,
     .recv_client_initial = recv_client_initial,
@@ -591,7 +752,7 @@ ngtcp2_conn *setup_conn(FuzzedDataProvider &fuzzed_data_provider,
   ngtcp2_settings_default(&settings);
 
   settings.qlog_write = qlog_write;
-  settings.cc_algo = fuzzed_data_provider.PickValueInArray(
+  settings.cc_algo = tls_state->fuzzed_data_provider->PickValueInArray(
     {NGTCP2_CC_ALGO_RENO, NGTCP2_CC_ALGO_CUBIC, NGTCP2_CC_ALGO_BBR});
 
   ngtcp2_transport_params params;
@@ -613,111 +774,70 @@ ngtcp2_conn *setup_conn(FuzzedDataProvider &fuzzed_data_provider,
 
   ngtcp2_conn *conn;
 
-  if (fuzzed_data_provider.ConsumeBool()) {
+  if (tls_state->fuzzed_data_provider->ConsumeBool()) {
     params.original_dcid_present = 1;
     params.stateless_reset_token_present = 1;
 
-    auto rv = ngtcp2_conn_server_new(&conn, &dcid, &scid, &ps.path,
-                                     NGTCP2_PROTO_VER_V1, &cb, &settings,
-                                     &params, &mem, &fuzzed_data_provider);
+    auto rv =
+      ngtcp2_conn_server_new(&conn, &dcid, &scid, &ps.path, NGTCP2_PROTO_VER_V1,
+                             &cb, &settings, &params, &mem, tls_state);
     if (rv != 0) {
       return nullptr;
     }
   } else {
-    auto rv = ngtcp2_conn_client_new(&conn, &dcid, &scid, &ps.path,
-                                     NGTCP2_PROTO_VER_V1, &cb, &settings,
-                                     &params, &mem, &fuzzed_data_provider);
+    auto rv =
+      ngtcp2_conn_client_new(&conn, &dcid, &scid, &ps.path, NGTCP2_PROTO_VER_V1,
+                             &cb, &settings, &params, &mem, tls_state);
     if (rv != 0) {
       return nullptr;
     }
-  }
 
-  ngtcp2_crypto_ctx crypto_ctx{
-    .aead =
-      {
-        .max_overhead = NGTCP2_FAKE_AEAD_OVERHEAD,
-      },
-    .max_encryption = 9999,
-    .max_decryption_failure = 8888,
-  };
+    ngtcp2_crypto_ctx crypto_ctx{
+      .aead =
+        {
+          .max_overhead = NGTCP2_FAKE_AEAD_OVERHEAD,
+        },
+      .max_encryption = 9999,
+      .max_decryption_failure = 8888,
+    };
 
-  ngtcp2_conn_set_initial_crypto_ctx(conn, &crypto_ctx);
+    ngtcp2_conn_set_initial_crypto_ctx(conn, &crypto_ctx);
 
-  ngtcp2_crypto_aead_ctx aead_ctx{};
-  ngtcp2_crypto_cipher_ctx hp_ctx{};
+    ngtcp2_crypto_aead_ctx aead_ctx{};
+    ngtcp2_crypto_cipher_ctx hp_ctx{};
 
-  auto rv = ngtcp2_conn_install_initial_key(conn, &aead_ctx, null_iv, &hp_ctx,
-                                            &aead_ctx, null_iv, &hp_ctx,
-                                            sizeof(null_iv));
-  if (rv != 0) {
-    ngtcp2_conn_del(conn);
-    return nullptr;
-  }
-
-  ngtcp2_conn_set_crypto_ctx(conn, &crypto_ctx);
-
-  rv = ngtcp2_conn_install_rx_handshake_key(conn, &aead_ctx, null_iv,
-                                            sizeof(null_iv), &hp_ctx);
-  if (rv != 0) {
-    ngtcp2_conn_del(conn);
-    return nullptr;
-  }
-
-  rv = ngtcp2_conn_install_tx_handshake_key(conn, &aead_ctx, null_iv,
-                                            sizeof(null_iv), &hp_ctx);
-  if (rv != 0) {
-    ngtcp2_conn_del(conn);
-    return nullptr;
-  }
-
-  rv = ngtcp2_conn_install_rx_key(conn, null_secret, sizeof(null_secret),
-                                  &aead_ctx, null_iv, sizeof(null_iv), &hp_ctx);
-  if (rv != 0) {
-    ngtcp2_conn_del(conn);
-    return nullptr;
-  }
-
-  rv = ngtcp2_conn_install_tx_key(conn, null_secret, sizeof(null_secret),
-                                  &aead_ctx, null_iv, sizeof(null_iv), &hp_ctx);
-  if (rv != 0) {
-    ngtcp2_conn_del(conn);
-    return nullptr;
-  }
-
-  ngtcp2_conn_discard_initial_state(conn, 0);
-  ngtcp2_conn_discard_handshake_state(conn, 0);
-
-  conn->state = NGTCP2_CS_POST_HANDSHAKE;
-  conn->flags |= NGTCP2_CONN_FLAG_INITIAL_PKT_PROCESSED |
-                 NGTCP2_CONN_FLAG_TLS_HANDSHAKE_COMPLETED |
-                 NGTCP2_CONN_FLAG_HANDSHAKE_COMPLETED |
-                 NGTCP2_CONN_FLAG_HANDSHAKE_CONFIRMED;
-  conn->dcid.current.flags |= NGTCP2_DCID_FLAG_PATH_VALIDATED;
-
-  {
-    auto it = ngtcp2_ksl_begin(&conn->scid.set);
-    auto scid = static_cast<ngtcp2_scid *>(ngtcp2_ksl_it_get(&it));
-
-    scid->flags |= NGTCP2_SCID_FLAG_USED;
-
-    rv = ngtcp2_pq_push(&conn->scid.used, &scid->pe);
-    if (rv != 0) {
+    if (ngtcp2_conn_install_initial_key(conn, &aead_ctx, null_iv, &hp_ctx,
+                                        &aead_ctx, null_iv, &hp_ctx,
+                                        sizeof(null_iv)) != 0) {
       ngtcp2_conn_del(conn);
       return nullptr;
     }
-  }
 
-  conn->negotiated_version = conn->client_chosen_version;
-  conn->handshake_confirmed_ts = 0;
+    /* if (ngtcp2_conn_install_rx_handshake_key(conn, &aead_ctx, null_iv,
+                                             sizeof(null_iv), &hp_ctx) != 0) {
+      ngtcp2_conn_del(conn);
+      return nullptr;
+    }
 
-  auto chunk_len = fuzzed_data_provider.ConsumeIntegral<size_t>();
-  auto chunk = fuzzed_data_provider.ConsumeBytes<uint8_t>(chunk_len);
+    if (ngtcp2_conn_install_tx_handshake_key(conn, &aead_ctx, null_iv,
+                                             sizeof(null_iv), &hp_ctx) != 0) {
+      ngtcp2_conn_del(conn);
+      return nullptr;
+    }
 
-  rv = ngtcp2_conn_decode_and_set_remote_transport_params(conn, chunk.data(),
-                                                          chunk.size());
-  if (rv != 0) {
-    ngtcp2_conn_del(conn);
-    return nullptr;
+    if (ngtcp2_conn_install_rx_key(conn, null_secret, sizeof(null_secret),
+                                   &aead_ctx, null_iv, sizeof(null_iv),
+                                   &hp_ctx)) {
+      ngtcp2_conn_del(conn);
+      return nullptr;
+    }
+
+    if (ngtcp2_conn_install_tx_key(conn, null_secret, sizeof(null_secret),
+                                   &aead_ctx, null_iv, sizeof(null_iv),
+                                   &hp_ctx) != 0) {
+      ngtcp2_conn_del(conn);
+      return nullptr;
+    }*/
   }
 
   return conn;
@@ -742,7 +862,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   mem.calloc = fuzzed_calloc;
   mem.realloc = fuzzed_realloc;
 
-  auto conn = setup_conn(fuzzed_data_provider, mem);
+  TLSState state{.fuzzed_data_provider = &fuzzed_data_provider};
+
+  auto conn = setup_conn(&state, mem);
   if (conn == nullptr) {
     return 0;
   }
